@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from io import BytesIO
 from datetime import date, timedelta
@@ -12,17 +13,22 @@ from tiny_unet import TinyUNet
 
 
 # ============================================================
-# VEYORA — SAR Oil Spill Screening
+# VEYORA CONFIGURATION
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
+DEVICE = torch.device("cpu")
 
+# Official Copernicus Data Space Ecosystem endpoints
 TOKEN_URL = (
-    "https://services.sentinel-hub.com/"
-    "auth/realms/main/protocol/openid-connect/token"
+    "https://identity.dataspace.copernicus.eu/"
+    "auth/realms/CDSE/protocol/openid-connect/token"
 )
-PROCESS_URL = "https://services.sentinel-hub.com/api/v1/process"
+
+PROCESS_URL = (
+    "https://sh.dataspace.copernicus.eu/api/v1/process"
+)
 
 st.set_page_config(
     page_title="VEYORA | SAR Oil Spill Screening",
@@ -30,17 +36,10 @@ st.set_page_config(
     layout="wide",
 )
 
-DEVICE = torch.device("cpu")
-
-
-# ============================================================
-# PAGE STYLE
-# ============================================================
-
 st.markdown(
     """
     <style>
-    .main {
+    .stApp {
         background-color: #071521;
         color: #e8f1f8;
     }
@@ -53,13 +52,6 @@ st.markdown(
         padding: 12px;
         border-radius: 10px;
     }
-    .veyora-note {
-        padding: 12px;
-        border-radius: 8px;
-        background: #102736;
-        border-left: 4px solid #62d9e8;
-        margin-bottom: 15px;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -67,11 +59,10 @@ st.markdown(
 
 
 # ============================================================
-# SECRETS
+# CREDENTIALS
 # ============================================================
 
 def get_secret(*names):
-    """Return the first configured Streamlit secret from the names."""
     for name in names:
         try:
             value = st.secrets.get(name)
@@ -82,28 +73,26 @@ def get_secret(*names):
     return None
 
 
-
 def get_credentials():
     client_id = get_secret(
+        "CDSE_CLIENT_ID",
         "SH_CLIENT_ID",
         "SENTINEL_HUB_CLIENT_ID",
-        "CDSE_CLIENT_ID",
         "CLIENT_ID",
     )
 
     client_secret = get_secret(
+        "CDSE_CLIENT_SECRET",
         "SH_CLIENT_SECRET",
         "SENTINEL_HUB_CLIENT_SECRET",
-        "CDSE_CLIENT_SECRET",
         "CLIENT_SECRET",
     )
 
     return client_id, client_secret
 
 
-
 # ============================================================
-# SENTINEL HUB AUTHENTICATION
+# AUTHENTICATION
 # ============================================================
 
 @st.cache_data(ttl=3000, show_spinner=False)
@@ -120,29 +109,25 @@ def get_access_token(client_id, client_secret):
 
     if not response.ok:
         raise RuntimeError(
-            f"Authentication failed ({response.status_code}): "
+            f"CDSE authentication failed ({response.status_code}): "
             f"{response.text[:500]}"
         )
 
     token = response.json().get("access_token")
 
     if not token:
-        raise RuntimeError("Authentication response did not contain a token.")
+        raise RuntimeError(
+            "CDSE authentication response did not contain an access token."
+        )
 
     return token
 
 
 # ============================================================
-# SENTINEL-1 DATA REQUEST
+# SENTINEL-1 EVALSCRIPT
 # ============================================================
 
 def make_evalscript():
-    """
-    Produce a 3-channel visualisation from Sentinel-1 VV and VH.
-
-    These channels are SAR-derived pseudo-RGB, not true optical RGB.
-    The trained model's performance on this input must be validated.
-    """
     return """
     //VERSION=3
 
@@ -184,6 +169,10 @@ def make_evalscript():
     """
 
 
+# ============================================================
+# FETCH SENTINEL-1 IMAGE
+# ============================================================
+
 def fetch_sentinel1_image(
     token,
     bbox,
@@ -192,15 +181,6 @@ def fetch_sentinel1_image(
     width=512,
     height=512,
 ):
-    """
-    Fetch Sentinel-1 GRD VV/VH data for a WGS84 bounding box.
-
-    bbox format:
-        [minimum longitude, minimum latitude,
-         maximum longitude, maximum latitude]
-    """
-    evalscript = make_evalscript()
-
     payload = {
         "input": {
             "bounds": {
@@ -235,7 +215,7 @@ def fetch_sentinel1_image(
                 }
             ],
         },
-        "evalscript": evalscript,
+        "evalscript": make_evalscript(),
     }
 
     response = requests.post(
@@ -247,31 +227,25 @@ def fetch_sentinel1_image(
 
     if not response.ok:
         raise RuntimeError(
-            f"Sentinel Hub request failed ({response.status_code}): "
+            f"Sentinel-1 Processing API failed ({response.status_code}): "
             f"{response.text[:1000]}"
         )
 
     try:
-        image = Image.open(BytesIO(response.content)).convert("RGB")
-        return image
+        return Image.open(BytesIO(response.content)).convert("RGB")
     except Exception as exc:
         raise RuntimeError(
-            "Sentinel Hub returned a response that could not be read as an image. "
-            f"Details: {exc}"
+            f"Could not decode the Sentinel Hub image response: {exc}"
         ) from exc
 
 
 # ============================================================
-# MODEL LOADING
+# LOAD TRAINED MODEL
 # ============================================================
 
 def extract_state_dict(checkpoint):
-    """Support common PyTorch checkpoint dictionary formats."""
     if not isinstance(checkpoint, dict):
-        raise RuntimeError(
-            "Unexpected checkpoint format. Expected a PyTorch state dictionary "
-            "or a checkpoint dictionary."
-        )
+        raise RuntimeError("The checkpoint is not a PyTorch dictionary.")
 
     for key in (
         "model_state",
@@ -285,12 +259,13 @@ def extract_state_dict(checkpoint):
             if all(torch.is_tensor(v) for v in value.values()):
                 return value
 
-    if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
+    if checkpoint and all(
+        torch.is_tensor(v) for v in checkpoint.values()
+    ):
         return checkpoint
 
     raise RuntimeError(
-        "Could not find model weights in the checkpoint. "
-        "Expected model_state, model_state_dict, state_dict, or raw weights."
+        "Could not locate the trained model weights in best.pt."
     )
 
 
@@ -298,12 +273,11 @@ def extract_state_dict(checkpoint):
 def load_model():
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
-            f"Model checkpoint not found: {MODEL_PATH}\n"
-            "Confirm that models/best.pt is committed to your repository."
+            f"Model not found: {MODEL_PATH}. "
+            "Check that models/best.pt exists in your GitHub repository."
         )
 
-    # weights_only=False is required for some checkpoint formats.
-    # Only use this with a checkpoint from your own trusted training run.
+    # Use only for your own trusted training checkpoint.
     checkpoint = torch.load(
         str(MODEL_PATH),
         map_location=DEVICE,
@@ -312,7 +286,6 @@ def load_model():
 
     state_dict = extract_state_dict(checkpoint)
 
-    # Remove DataParallel prefixes if present.
     cleaned_state_dict = {}
     for key, value in state_dict.items():
         if key.startswith("module."):
@@ -333,74 +306,62 @@ def load_model():
 
 
 # ============================================================
-# MODEL INFERENCE
+# AI INFERENCE
 # ============================================================
 
 def run_inference(model, image):
-    """
-    Return a predicted class mask and target-class probability map.
-
-    This assumes class index 1 is the oil-spill class. Confirm this
-    against the labels used to train the checkpoint.
-    """
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
 
-    # HWC -> CHW -> NCHW
-    tensor = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0)
-    tensor = tensor.to(DEVICE)
+    tensor = torch.from_numpy(
+        rgb.transpose(2, 0, 1)
+    ).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
         logits = model(tensor)
 
         if logits.ndim != 4 or logits.shape[1] != 2:
             raise RuntimeError(
-                "Unexpected model output. Expected shape [1, 2, height, width]. "
-                f"Received {tuple(logits.shape)}."
+                "Expected model output [1, 2, height, width], "
+                f"received {tuple(logits.shape)}."
             )
 
         probabilities = torch.softmax(logits, dim=1)
         target_probability = probabilities[0, 1].cpu().numpy()
-        predicted_mask = (
+
+        mask = (
             probabilities.argmax(dim=1)[0].cpu().numpy() == 1
         ).astype(np.uint8)
 
-    return predicted_mask, target_probability
+    return mask, target_probability
 
 
 # ============================================================
-# VISUALISATION HELPERS
+# OUTPUT VISUALISATIONS
 # ============================================================
-
-def make_mask_image(mask):
-    """Convert a binary mask into a visible grayscale PNG."""
-    mask_image = Image.fromarray((mask * 255).astype(np.uint8))
-    return mask_image
-
 
 def make_overlay(image, mask, alpha=0.45):
-    """Create an RGB overlay highlighting predicted target pixels."""
     base = np.asarray(image.convert("RGB"), dtype=np.float32)
+    overlay = base.copy()
 
-    # Cyan highlight for predicted target pixels.
     highlight = np.zeros_like(base)
-    highlight[:, :, 0] = 0
     highlight[:, :, 1] = 255
     highlight[:, :, 2] = 255
 
-    overlay = base.copy()
     selected = mask.astype(bool)
     overlay[selected] = (
-        (1 - alpha) * base[selected] + alpha * highlight[selected]
+        (1 - alpha) * base[selected]
+        + alpha * highlight[selected]
     )
 
-    return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
-
-
-def make_probability_image(probability):
-    """Convert target-class probabilities to an 8-bit grayscale image."""
     return Image.fromarray(
-        np.clip(probability * 255, 0, 255).astype(np.uint8)
+        np.clip(overlay, 0, 255).astype(np.uint8)
     )
+
+
+def image_to_bytes(image):
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 # ============================================================
@@ -408,9 +369,9 @@ def make_probability_image(probability):
 # ============================================================
 
 st.sidebar.title("🌊 VEYORA")
-st.sidebar.caption("Satellite SAR oil-spill screening")
+st.sidebar.caption("Satellite SAR Oil Spill Screening")
 
-st.sidebar.markdown("### Area of interest")
+st.sidebar.subheader("Area of interest")
 
 min_lon = st.sidebar.number_input(
     "Minimum longitude",
@@ -448,14 +409,14 @@ max_lat = st.sidebar.number_input(
     format="%.4f",
 )
 
-st.sidebar.markdown("### Acquisition dates")
+st.sidebar.subheader("Acquisition dates")
 
 today = date.today()
-default_start = today - timedelta(days=30)
+start_default = today - timedelta(days=30)
 
 start_date = st.sidebar.date_input(
     "Start date",
-    value=default_start,
+    value=start_default,
     max_value=today,
 )
 
@@ -466,11 +427,9 @@ end_date = st.sidebar.date_input(
     max_value=today,
 )
 
-st.sidebar.markdown("### Image settings")
-
 image_size = st.sidebar.selectbox(
-    "Output image size",
-    options=[256, 512, 768, 1024],
+    "Image resolution",
+    [256, 512, 768, 1024],
     index=1,
 )
 
@@ -482,92 +441,78 @@ run_button = st.sidebar.button(
 
 
 # ============================================================
-# MAIN PAGE
+# MAIN INTERFACE
 # ============================================================
 
 st.title("VEYORA")
 st.subheader("Satellite-based SAR Oil Spill Screening")
 
-st.markdown(
-    """
-    <div class="veyora-note">
-    <b>Purpose:</b> Retrieve Sentinel-1 VV/VH radar data and run a
-    segmentation model to screen for possible oil-spill-like regions.
-    Model outputs are experimental and require validation.
-    </div>
-    """,
-    unsafe_allow_html=True,
+st.info(
+    "VEYORA retrieves Sentinel-1 radar imagery and runs an experimental "
+    "segmentation model to identify possible target regions. Outputs are "
+    "not confirmed oil-spill detections."
 )
 
-left, right = st.columns(2)
+col1, col2 = st.columns(2)
 
-with left:
-    st.markdown("#### Data source")
-    st.write("Copernicus Sentinel-1 GRD via Sentinel Hub Processing API")
+with col1:
+    st.markdown("**Satellite data**")
+    st.write("Copernicus Sentinel-1 GRD")
 
-with right:
-    st.markdown("#### AI model")
-    st.write("Two-class segmentation model loaded from `models/best.pt`")
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-bbox = [min_lon, min_lat, max_lon, max_lat]
-
-bbox_is_valid = (
-    min_lon < max_lon
-    and min_lat < max_lat
-    and -180 <= min_lon <= 180
-    and -180 <= max_lon <= 180
-    and -90 <= min_lat <= 90
-    and -90 <= max_lat <= 90
-)
-
-if not bbox_is_valid:
-    st.warning(
-        "Please enter a valid bounding box. Minimum coordinates must be "
-        "smaller than maximum coordinates."
-    )
-
-if start_date > end_date:
-    st.warning("The start date must be on or before the end date.")
+with col2:
+    st.markdown("**AI checkpoint**")
+    st.write("`models/best.pt`")
 
 
 # ============================================================
-# EXECUTION
+# RUN
 # ============================================================
 
 if run_button:
-    if not bbox_is_valid:
-        st.error("Cannot continue: the bounding box is invalid.")
+    valid_bbox = min_lon < max_lon and min_lat < max_lat
+
+    if not valid_bbox:
+        st.error(
+            "Invalid bounding box: minimum coordinates must be "
+            "less than maximum coordinates."
+        )
 
     elif start_date > end_date:
-        st.error("Cannot continue: the date range is invalid.")
+        st.error("The start date must not be after the end date.")
 
     else:
         client_id, client_secret = get_credentials()
 
         if not client_id or not client_secret:
             st.error(
-                "Sentinel Hub credentials are missing. Add your client ID "
-                "and client secret to Streamlit Cloud → App settings → Secrets."
+                "CDSE credentials are missing. Check Streamlit Cloud "
+                "Settings → Secrets."
             )
+
             st.code(
-                """
-SH_CLIENT_ID = "your-client-id"
-SH_CLIENT_SECRET = "your-client-secret"
-                """.strip(),
+                'CDSE_CLIENT_ID = "your-client-id"\n'
+                'CDSE_CLIENT_SECRET = "your-client-secret"',
                 language="toml",
             )
 
         else:
             try:
-                with st.spinner("Authenticating with Sentinel Hub..."):
-                    token = get_access_token(client_id, client_secret)
+                with st.spinner("Authenticating with CDSE..."):
+                    token = get_access_token(
+                        client_id,
+                        client_secret,
+                    )
 
-                with st.spinner("Retrieving Sentinel-1 VV/VH imagery..."):
+                st.success("CDSE authentication successful.")
+
+                bbox = [
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                ]
+
+                with st.spinner("Fetching Sentinel-1 imagery..."):
                     image = fetch_sentinel1_image(
                         token=token,
                         bbox=bbox,
@@ -577,154 +522,145 @@ SH_CLIENT_SECRET = "your-client-secret"
                         height=image_size,
                     )
 
-                st.success("Sentinel-1 imagery retrieved successfully.")
+                st.success("Sentinel-1 imagery retrieved.")
 
                 st.markdown("### Retrieved SAR visualisation")
                 st.image(
                     image,
-                    caption=(
-                        f"SAR-derived pseudo-RGB | "
-                        f"{start_date} to {end_date}"
-                    ),
+                    caption="Sentinel-1 VV/VH-derived pseudo-RGB",
                     use_container_width=True,
                 )
 
-                with st.spinner("Loading trained segmentation model..."):
+                with st.spinner("Loading the trained AI model..."):
                     model = load_model()
 
-                with st.spinner("Running experimental AI segmentation..."):
+                with st.spinner("Running AI segmentation..."):
                     mask, probability = run_inference(model, image)
 
                 overlay = make_overlay(image, mask)
-                mask_image = make_mask_image(mask)
-                probability_image = make_probability_image(probability)
 
-                predicted_pixels = int(mask.sum())
+                mask_image = Image.fromarray(
+                    (mask * 255).astype(np.uint8)
+                )
+
+                probability_image = Image.fromarray(
+                    np.clip(
+                        probability * 255,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                )
+
+                target_pixels = int(mask.sum())
                 total_pixels = int(mask.size)
-                predicted_percentage = (
-                    100.0 * predicted_pixels / total_pixels
+                flagged_percentage = (
+                    target_pixels / total_pixels * 100
                     if total_pixels
                     else 0.0
                 )
 
                 st.markdown("### Screening results")
 
-                metric1, metric2, metric3 = st.columns(3)
+                m1, m2, m3 = st.columns(3)
 
-                metric1.metric(
+                m1.metric(
                     "Predicted target pixels",
-                    f"{predicted_pixels:,}",
+                    f"{target_pixels:,}",
                 )
 
-                metric2.metric(
+                m2.metric(
                     "Image area flagged",
-                    f"{predicted_percentage:.2f}%",
+                    f"{flagged_percentage:.2f}%",
                 )
 
-                metric3.metric(
+                m3.metric(
                     "Mean target probability",
                     f"{float(probability.mean()):.3f}",
                 )
 
                 st.warning(
-                    "These values describe model predictions, not confirmed "
-                    "oil spills. Dark SAR areas can also result from low wind, "
-                    "look-alikes, sensor conditions, or other surface effects."
+                    "Predictions are experimental. Dark or smooth SAR "
+                    "regions can arise from several causes other than oil. "
+                    "Independent verification is necessary."
                 )
 
-                st.markdown("### AI output")
+                st.markdown("### AI segmentation")
 
-                col1, col2 = st.columns(2)
+                c1, c2 = st.columns(2)
 
-                with col1:
+                with c1:
                     st.image(
                         overlay,
-                        caption="Predicted target regions overlaid on SAR imagery",
+                        caption="Predicted target regions",
                         use_container_width=True,
                     )
 
-                with col2:
+                with c2:
                     st.image(
                         mask_image,
-                        caption="Binary segmentation mask",
+                        caption="Binary prediction mask",
                         use_container_width=True,
                     )
 
-                st.markdown("### Target-class probability")
+                st.markdown("### Target-class probability map")
 
                 st.image(
                     probability_image,
-                    caption=(
-                        "Brighter pixels indicate higher model probability "
-                        "for class index 1."
-                    ),
+                    caption="Brighter pixels represent higher class-1 probability",
                     use_container_width=True,
                 )
 
-                st.markdown("### Download outputs")
+                st.markdown("### Download results")
 
-                download_col1, download_col2, download_col3 = st.columns(3)
+                d1, d2, d3 = st.columns(3)
 
-                with download_col1:
+                with d1:
                     st.download_button(
                         "Download SAR image",
-                        data=BytesIO(
-                            _image_bytes := (
-                                lambda buffer: (
-                                    image.save(buffer, format="PNG"),
-                                    buffer.getvalue(),
-                                )[1]
-                            )(BytesIO())
-                        ).getvalue(),
+                        data=image_to_bytes(image),
                         file_name="veyora_sar_image.png",
                         mime="image/png",
                         use_container_width=True,
                     )
 
-                with download_col2:
-                    mask_buffer = BytesIO()
-                    mask_image.save(mask_buffer, format="PNG")
-
+                with d2:
                     st.download_button(
                         "Download AI mask",
-                        data=mask_buffer.getvalue(),
+                        data=image_to_bytes(mask_image),
                         file_name="veyora_ai_mask.png",
                         mime="image/png",
                         use_container_width=True,
                     )
 
-                with download_col3:
-                    overlay_buffer = BytesIO()
-                    overlay.save(overlay_buffer, format="PNG")
-
+                with d3:
                     st.download_button(
                         "Download overlay",
-                        data=overlay_buffer.getvalue(),
+                        data=image_to_bytes(overlay),
                         file_name="veyora_ai_overlay.png",
                         mime="image/png",
                         use_container_width=True,
                     )
 
                 st.caption(
-                    f"Bounding box: {bbox} | "
-                    f"Dates: {start_date} to {end_date} | "
-                    f"Device: {DEVICE}"
+                    f"Date range: {start_date} to {end_date} | "
+                    f"Bounding box: {bbox} | Device: {DEVICE}"
                 )
 
             except Exception as exc:
-                st.error("The screening process could not be completed.")
+                st.error("VEYORA could not complete the screening.")
                 st.code(f"{type(exc).__name__}: {exc}")
 
                 st.markdown(
                     """
                     **Troubleshooting**
-                    - Check that Sentinel Hub credentials are correct.
-                    - Check that `models/best.pt` exists in your repository.
-                    - If the error mentions missing or unexpected model keys,
-                      the `TinyUNet` architecture in `tiny_unet.py` must match
-                      the architecture used during training.
-                    - If Sentinel Hub reports no data, try another date range
-                      or a different area of interest.
+                    - `401 invalid_client`: verify the CDSE OAuth client ID,
+                      matching client secret, and credentials configuration.
+                    - `403`: verify service access and permissions.
+                    - `400`: inspect the Processing API error for invalid
+                      parameters or unavailable data.
+                    - `FileNotFoundError`: check `models/best.pt`.
+                    - `Missing key(s)` / `Unexpected key(s)`: the model
+                      architecture in `tiny_unet.py` may not match training.
                     """
                 )
 
@@ -736,7 +672,6 @@ SH_CLIENT_SECRET = "your-client-secret"
 st.divider()
 
 st.caption(
-    "VEYORA | Experimental satellite-based oil-spill screening. "
-    "AI outputs are not a substitute for expert interpretation or "
-    "independent confirmation."
+    "VEYORA | Experimental satellite-based SAR oil-spill screening. "
+    "AI predictions require validation and expert interpretation."
 )
