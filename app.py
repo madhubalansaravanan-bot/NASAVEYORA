@@ -1,47 +1,105 @@
-
-import io
 from pathlib import Path
+from io import BytesIO
 from datetime import date, timedelta
 
-import cv2
-import folium
 import numpy as np
 import requests
 import streamlit as st
 import torch
 from PIL import Image
-from rasterio.io import MemoryFile
-from streamlit_folium import st_folium
 
 from tiny_unet import TinyUNet
 
 
-# ==================================================
-# VEYORA CONFIGURATION
-# ==================================================
-
-st.set_page_config(
-    page_title="VEYORA | Satellite Intelligence",
-    page_icon="🛰️",
-    layout="wide",
-)
-
-st.title("🛰️ VEYORA")
-st.subheader("Live Sentinel-1 Oil-Spill Candidate Screening")
-
-TOKEN_URL = (
-    "https://identity.dataspace.copernicus.eu/"
-    "auth/realms/CDSE/protocol/openid-connect/token"
-)
-PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
+# ============================================================
+# VEYORA — SAR Oil Spill Screening
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
+TOKEN_URL = (
+    "https://services.sentinel-hub.com/"
+    "auth/realms/main/protocol/openid-connect/token"
+)
+PROCESS_URL = "https://services.sentinel-hub.com/api/v1/process"
 
-# ==================================================
-# COPERNICUS AUTHENTICATION
-# ==================================================
+st.set_page_config(
+    page_title="VEYORA | SAR Oil Spill Screening",
+    page_icon="🌊",
+    layout="wide",
+)
+
+DEVICE = torch.device("cpu")
+
+
+# ============================================================
+# PAGE STYLE
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+    .main {
+        background-color: #071521;
+        color: #e8f1f8;
+    }
+    h1, h2, h3 {
+        color: #62d9e8 !important;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #102736;
+        border: 1px solid #245064;
+        padding: 12px;
+        border-radius: 10px;
+    }
+    .veyora-note {
+        padding: 12px;
+        border-radius: 8px;
+        background: #102736;
+        border-left: 4px solid #62d9e8;
+        margin-bottom: 15px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# SECRETS
+# ============================================================
+
+def get_secret(*names):
+    """Return the first configured Streamlit secret from the names."""
+    for name in names:
+        try:
+            value = st.secrets.get(name)
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+    return None
+
+
+def get_credentials():
+    client_id = get_secret(
+        "SH_CLIENT_ID",
+        "SENTINEL_HUB_CLIENT_ID",
+        "CLIENT_ID",
+    )
+    client_secret = get_secret(
+        "SH_CLIENT_SECRET",
+        "SENTINEL_HUB_CLIENT_SECRET",
+        "CLIENT_SECRET",
+    )
+
+    return client_id, client_secret
+
+
+# ============================================================
+# SENTINEL HUB AUTHENTICATION
+# ============================================================
 
 @st.cache_data(ttl=3000, show_spinner=False)
 def get_access_token(client_id, client_secret):
@@ -54,43 +112,96 @@ def get_access_token(client_id, client_secret):
         },
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()["access_token"]
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Authentication failed ({response.status_code}): "
+            f"{response.text[:500]}"
+        )
+
+    token = response.json().get("access_token")
+
+    if not token:
+        raise RuntimeError("Authentication response did not contain a token.")
+
+    return token
 
 
-# ==================================================
-# FETCH SENTINEL-1 VV / VH DATA
-# ==================================================
+# ============================================================
+# SENTINEL-1 DATA REQUEST
+# ============================================================
 
-def fetch_sentinel1(bbox, start_date, end_date, token):
-    evalscript = """
+def make_evalscript():
+    """
+    Produce a 3-channel visualisation from Sentinel-1 VV and VH.
+
+    These channels are SAR-derived pseudo-RGB, not true optical RGB.
+    The trained model's performance on this input must be validated.
+    """
+    return """
     //VERSION=3
+
     function setup() {
-      return {
-        input: [{
-          bands: ["VV", "VH"],
-          units: "LINEAR_POWER"
-        }],
-        output: {
-          bands: 2,
-          sampleType: "FLOAT32"
-        }
-      };
+        return {
+            input: [{
+                bands: ["VV", "VH"],
+                units: "LINEAR_POWER"
+            }],
+            output: {
+                bands: 3,
+                sampleType: "UINT8"
+            }
+        };
     }
-    function evaluatePixel(s) {
-      return [s.VV, s.VH];
+
+    function clamp01(x) {
+        return Math.max(0.0, Math.min(1.0, x));
+    }
+
+    function toDb(x) {
+        return 10.0 * Math.log(Math.max(x, 0.00000001)) / Math.LN10;
+    }
+
+    function evaluatePixel(sample) {
+        let vvDb = toDb(sample.VV);
+        let vhDb = toDb(sample.VH);
+
+        let vv = clamp01((vvDb + 30.0) / 30.0);
+        let vh = clamp01((vhDb + 35.0) / 30.0);
+        let ratio = clamp01(((vvDb - vhDb) + 5.0) / 25.0);
+
+        return [
+            Math.round(vv * 255.0),
+            Math.round(vh * 255.0),
+            Math.round(ratio * 255.0)
+        ];
     }
     """
+
+
+def fetch_sentinel1_image(
+    token,
+    bbox,
+    start_date,
+    end_date,
+    width=512,
+    height=512,
+):
+    """
+    Fetch Sentinel-1 GRD VV/VH data for a WGS84 bounding box.
+
+    bbox format:
+        [minimum longitude, minimum latitude,
+         maximum longitude, maximum latitude]
+    """
+    evalscript = make_evalscript()
 
     payload = {
         "input": {
             "bounds": {
                 "bbox": bbox,
                 "properties": {
-                    "crs": (
-                        "http://www.opengis.net/def/crs/"
-                        "EPSG/0/4326"
-                    )
+                    "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"
                 },
             },
             "data": [
@@ -101,23 +212,21 @@ def fetch_sentinel1(bbox, start_date, end_date, token):
                             "from": f"{start_date}T00:00:00Z",
                             "to": f"{end_date}T23:59:59Z",
                         },
+                        "resolution": "HIGH",
                         "acquisitionMode": "IW",
                         "polarization": "DV",
-                    },
-                    "processing": {
                         "orthorectify": True,
-                        "backCoeff": "SIGMA0_ELLIPSOID",
                     },
                 }
             ],
         },
         "output": {
-            "width": 512,
-            "height": 512,
+            "width": width,
+            "height": height,
             "responses": [
                 {
                     "identifier": "default",
-                    "format": {"type": "image/tiff"},
+                    "format": {"type": "image/png"},
                 }
             ],
         },
@@ -128,497 +237,501 @@ def fetch_sentinel1(bbox, start_date, end_date, token):
         PROCESS_URL,
         headers={"Authorization": f"Bearer {token}"},
         json=payload,
-        timeout=180,
+        timeout=120,
     )
 
     if not response.ok:
         raise RuntimeError(
-            f"Copernicus HTTP {response.status_code}: "
+            f"Sentinel Hub request failed ({response.status_code}): "
             f"{response.text[:1000]}"
         )
 
-    with MemoryFile(response.content) as memfile:
-        with memfile.open() as src:
-            bands = src.read().astype(np.float32)
-            profile = {
-                "crs": str(src.crs) if src.crs else None,
-                "transform": tuple(src.transform),
-                "width": src.width,
-                "height": src.height,
-                "bounds": tuple(src.bounds),
-            }
+    try:
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+        return image
+    except Exception as exc:
+        raise RuntimeError(
+            "Sentinel Hub returned a response that could not be read as an image. "
+            f"Details: {exc}"
+        ) from exc
 
-    if bands.shape[0] != 2:
-        raise ValueError(
-            f"Expected two VV/VH bands, got {bands.shape}"
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+def extract_state_dict(checkpoint):
+    """Support common PyTorch checkpoint dictionary formats."""
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(
+            "Unexpected checkpoint format. Expected a PyTorch state dictionary "
+            "or a checkpoint dictionary."
         )
 
-    return bands, profile
+    for key in (
+        "model_state",
+        "model_state_dict",
+        "state_dict",
+        "model",
+    ):
+        value = checkpoint.get(key)
+
+        if isinstance(value, dict) and value:
+            if all(torch.is_tensor(v) for v in value.values()):
+                return value
+
+    if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
+        return checkpoint
+
+    raise RuntimeError(
+        "Could not find model weights in the checkpoint. "
+        "Expected model_state, model_state_dict, state_dict, or raw weights."
+    )
 
 
-# ==================================================
-# LOAD TRAINED TINYUNET MODEL
-# ==================================================
+@st.cache_resource(show_spinner=False)
+def load_model():
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Model checkpoint not found: {MODEL_PATH}\n"
+            "Confirm that models/best.pt is committed to your repository."
+        )
 
-@st.cache_resource
-def load_model(model_path_string, model_mtime):
+    # weights_only=False is required for some checkpoint formats.
+    # Only use this with a checkpoint from your own trusted training run.
+    checkpoint = torch.load(
+        str(MODEL_PATH),
+        map_location=DEVICE,
+        weights_only=False,
+    )
+
+    state_dict = extract_state_dict(checkpoint)
+
+    # Remove DataParallel prefixes if present.
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            key = key[len("module."):]
+        cleaned_state_dict[key] = value
+
     model = TinyUNet(
         in_channels=3,
         num_classes=2,
         base_ch=32,
     )
 
-    checkpoint = torch.load(
-        model_path_string,
-        map_location="cpu",
-        weights_only=True,
-    )
-
-    # Training saves the weights inside "model_state".
-    state_dict = checkpoint.get("model_state", checkpoint)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(cleaned_state_dict, strict=True)
+    model.to(DEVICE)
     model.eval()
 
     return model
 
 
-# ==================================================
-# SAR PREPROCESSING
-# ==================================================
+# ============================================================
+# MODEL INFERENCE
+# ============================================================
 
-def to_db(bands):
-    """Convert linear radar power to decibels."""
-    return 10.0 * np.log10(np.maximum(bands, 1e-10))
-
-
-def display_rgb(vv_db):
-    """Display the VV radar band as grayscale RGB."""
-    valid = np.isfinite(vv_db)
-
-    if not valid.any():
-        return np.zeros((*vv_db.shape, 3), dtype=np.uint8)
-
-    lo, hi = np.percentile(vv_db[valid], [2, 98])
-
-    gray = np.clip(
-        (np.nan_to_num(vv_db, nan=lo) - lo)
-        / max(hi - lo, 1e-6) * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
-
-# ==================================================
-# EXPERIMENTAL VV/VH TO PSEUDO-RGB INPUT
-# ==================================================
-
-def prepare_model_input(bands_db):
+def run_inference(model, image):
     """
-    Convert live VV/VH radar bands into three channels.
+    Return a predicted class mask and target-class probability map.
 
-    This is an approximation. The model was trained on
-    RGB images, so live predictions require further
-    validation before they can be considered reliable.
+    This assumes class index 1 is the oil-spill class. Confirm this
+    against the labels used to train the checkpoint.
     """
-    vv = bands_db[0]
-    vh = bands_db[1]
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
 
-    vv_norm = np.clip((vv + 35.0) / 40.0, 0, 1)
-    vh_norm = np.clip((vh + 45.0) / 40.0, 0, 1)
-    diff_norm = np.clip((vv - vh + 20.0) / 40.0, 0, 1)
-
-    pseudo_rgb = np.stack(
-        [vv_norm, vh_norm, diff_norm],
-        axis=0,
-    ).astype(np.float32)
-
-    resized = np.stack([
-        cv2.resize(
-            channel,
-            (256, 256),
-            interpolation=cv2.INTER_AREA,
-        )
-        for channel in pseudo_rgb
-    ])
-
-    return torch.from_numpy(resized[None]).float()
-
-
-def predict_with_model(bands_db):
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Model checkpoint not found: {MODEL_PATH}"
-        )
-
-    model = load_model(
-        str(MODEL_PATH),
-        MODEL_PATH.stat().st_mtime,
-    )
-
-    tensor = prepare_model_input(bands_db)
+    # HWC -> CHW -> NCHW
+    tensor = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0)
+    tensor = tensor.to(DEVICE)
 
     with torch.no_grad():
         logits = model(tensor)
 
-        # Two-class model: class 0 = background,
-        # class 1 = labelled slick.
-        probabilities = torch.softmax(logits, dim=1)[0, 1]
-        probabilities = probabilities.cpu().numpy()
-
-    h, w = bands_db.shape[1:]
-
-    return cv2.resize(
-        probabilities,
-        (w, h),
-        interpolation=cv2.INTER_LINEAR,
-    )
-
-
-# ==================================================
-# DARK-TARGET FALLBACK
-# ==================================================
-
-def dark_target_fallback(vv_db, threshold_db, min_pixels):
-    valid = np.isfinite(vv_db)
-    clean = np.where(valid, vv_db, 0).astype(np.float32)
-    smooth = cv2.GaussianBlur(clean, (5, 5), 0)
-
-    binary = (
-        (smooth < threshold_db) & valid
-    ).astype(np.uint8)
-
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary,
-        connectivity=8,
-    )
-
-    mask = np.zeros_like(binary)
-
-    for i in range(1, count):
-        if stats[i, cv2.CC_STAT_AREA] >= min_pixels:
-            mask[labels == i] = 1
-
-    return mask
-
-
-# ==================================================
-# SIDEBAR
-# ==================================================
-
-with st.sidebar:
-    st.header("Satellite search")
-
-    region = st.selectbox(
-        "Region",
-        ["Chennai Coast", "Gulf of Mexico", "Custom"],
-    )
-
-    defaults = {
-        "Chennai Coast": [80.0, 12.5, 81.0, 13.5],
-        "Gulf of Mexico": [-92.0, 25.0, -90.0, 27.0],
-        "Custom": [80.0, 12.5, 81.0, 13.5],
-    }[region]
-
-    west = st.number_input(
-        "West longitude", value=float(defaults[0])
-    )
-    south = st.number_input(
-        "South latitude", value=float(defaults[1])
-    )
-    east = st.number_input(
-        "East longitude", value=float(defaults[2])
-    )
-    north = st.number_input(
-        "North latitude", value=float(defaults[3])
-    )
-
-    today = date.today()
-
-    end_date = st.date_input(
-        "End date",
-        value=today,
-    )
-    start_date = st.date_input(
-        "Start date",
-        value=today - timedelta(days=14),
-    )
-
-    st.header("Screening settings")
-
-    threshold_db = st.slider(
-        "Fallback VV threshold (dB)",
-        -35.0,
-        -5.0,
-        -18.0,
-        0.5,
-    )
-
-    min_pixels = st.slider(
-        "Minimum fallback region (pixels)",
-        5,
-        500,
-        25,
-    )
-
-    confidence_threshold = st.slider(
-        "Experimental model threshold",
-        0.1,
-        0.9,
-        0.5,
-        0.05,
-    )
-
-    run = st.button(
-        "Fetch Sentinel-1",
-        type="primary",
-    )
-
-
-# ==================================================
-# FETCH SATELLITE DATA
-# ==================================================
-
-if run:
-    if not (-180 <= west < east <= 180):
-        st.error("Invalid longitude bounds.")
-        st.stop()
-
-    if not (-90 <= south < north <= 90):
-        st.error("Invalid latitude bounds.")
-        st.stop()
-
-    if start_date > end_date:
-        st.error("Start date must not be after end date.")
-        st.stop()
-
-    if east - west > 3 or north - south > 3:
-        st.error("Choose an area no larger than 3 degrees per side.")
-        st.stop()
-
-    try:
-        client_id = st.secrets["CDSE_CLIENT_ID"]
-        client_secret = st.secrets["CDSE_CLIENT_SECRET"]
-    except Exception:
-        st.error(
-            "Set CDSE_CLIENT_ID and CDSE_CLIENT_SECRET "
-            "in Streamlit Cloud Secrets."
-        )
-        st.stop()
-
-    try:
-        with st.spinner("Fetching Sentinel-1 VV/VH data..."):
-            token = get_access_token(client_id, client_secret)
-
-            bands, profile = fetch_sentinel1(
-                [west, south, east, north],
-                start_date.isoformat(),
-                end_date.isoformat(),
-                token,
+        if logits.ndim != 4 or logits.shape[1] != 2:
+            raise RuntimeError(
+                "Unexpected model output. Expected shape [1, 2, height, width]. "
+                f"Received {tuple(logits.shape)}."
             )
 
-        st.session_state["bands"] = bands
-        st.session_state["profile"] = profile
-        st.session_state["bbox"] = [west, south, east, north]
-
-        st.success("Satellite data received successfully.")
-
-    except Exception as exc:
-        st.error(f"Satellite request failed: {exc}")
-
-
-# ==================================================
-# DISPLAY RESULTS
-# ==================================================
-
-if "bands" not in st.session_state:
-    st.info(
-        "Choose an area and date range, then click "
-        "'Fetch Sentinel-1'."
-    )
-    st.stop()
-
-bands = st.session_state["bands"]
-profile = st.session_state["profile"]
-bbox = st.session_state["bbox"]
-
-bands_db = to_db(bands)
-vv_db = bands_db[0]
-
-st.markdown("### 1. Live Sentinel-1 imagery")
-
-left, right = st.columns(2)
-base_rgb = display_rgb(vv_db)
-
-with left:
-    st.image(
-        base_rgb,
-        caption="Sentinel-1 VV intensity (dB)",
-        use_container_width=True,
-    )
-
-
-# ==================================================
-# RUN MODEL OR FALLBACK
-# ==================================================
-
-probabilities = None
-
-if MODEL_PATH.is_file():
-    try:
-        with st.spinner("Loading TinyUNet and analysing image..."):
-            probabilities = predict_with_model(bands_db)
-
-        mask = (
-            probabilities >= confidence_threshold
+        probabilities = torch.softmax(logits, dim=1)
+        target_probability = probabilities[0, 1].cpu().numpy()
+        predicted_mask = (
+            probabilities.argmax(dim=1)[0].cpu().numpy() == 1
         ).astype(np.uint8)
 
-        mode = "Experimental TinyUNet"
+    return predicted_mask, target_probability
 
-    except Exception as exc:
-        st.warning(f"Model inference failed: {exc}")
-        st.info("Using the dark-target screening fallback.")
 
-        mask = dark_target_fallback(
-            vv_db,
-            threshold_db,
-            min_pixels,
-        )
+# ============================================================
+# VISUALISATION HELPERS
+# ============================================================
 
-        mode = "Dark-target screening fallback"
+def make_mask_image(mask):
+    """Convert a binary mask into a visible grayscale PNG."""
+    mask_image = Image.fromarray((mask * 255).astype(np.uint8))
+    return mask_image
 
-else:
-    st.warning(
-        f"Model file not found at: {MODEL_PATH}"
+
+def make_overlay(image, mask, alpha=0.45):
+    """Create an RGB overlay highlighting predicted target pixels."""
+    base = np.asarray(image.convert("RGB"), dtype=np.float32)
+
+    # Cyan highlight for predicted target pixels.
+    highlight = np.zeros_like(base)
+    highlight[:, :, 0] = 0
+    highlight[:, :, 1] = 255
+    highlight[:, :, 2] = 255
+
+    overlay = base.copy()
+    selected = mask.astype(bool)
+    overlay[selected] = (
+        (1 - alpha) * base[selected] + alpha * highlight[selected]
     )
 
-    mask = dark_target_fallback(
-        vv_db,
-        threshold_db,
-        min_pixels,
-    )
-
-    mode = "Dark-target screening fallback"
+    return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
 
 
-# ==================================================
-# DISPLAY PREDICTIONS
-# ==================================================
-
-with right:
-    overlay = base_rgb.copy()
-    overlay[mask == 1] = [255, 40, 40]
-
-    overlay = cv2.addWeighted(
-        base_rgb,
-        0.65,
-        overlay,
-        0.35,
-        0,
-    )
-
-    st.image(
-        overlay,
-        caption=f"Red candidate regions — {mode}",
-        use_container_width=True,
-    )
-
-if probabilities is not None:
-    st.warning(
-        "EXPERIMENTAL AI OUTPUT: This model was trained "
-        "on RGB SAR-derived images. Live VV/VH inputs use "
-        "an approximate conversion. These predictions are "
-        "not validated oil-spill detections; independent "
-        "testing and human review are required."
-    )
-
-    st.image(
-        np.clip(probabilities * 255, 0, 255).astype(np.uint8),
-        caption="Experimental class-1 probability map",
-        use_container_width=True,
-    )
-
-else:
-    st.warning(
-        "SCREENING MODE: This is a dark-target heuristic, "
-        "not AI. Dark radar features can be caused by low "
-        "wind, natural films, and other radar effects."
+def make_probability_image(probability):
+    """Convert target-class probabilities to an 8-bit grayscale image."""
+    return Image.fromarray(
+        np.clip(probability * 255, 0, 255).astype(np.uint8)
     )
 
 
-# ==================================================
-# SUMMARY METRICS
-# ==================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-positive_pixels = int(mask.sum())
-total_pixels = mask.size
-coverage = 100.0 * positive_pixels / max(total_pixels, 1)
+st.sidebar.title("🌊 VEYORA")
+st.sidebar.caption("Satellite SAR oil-spill screening")
 
-m1, m2, m3 = st.columns(3)
+st.sidebar.markdown("### Area of interest")
 
-m1.metric("Candidate pixels", f"{positive_pixels:,}")
-m2.metric("Image coverage", f"{coverage:.2f}%")
-m3.metric("Analysis mode", mode)
-
-
-# ==================================================
-# REGION REFERENCE MAP
-# ==================================================
-
-st.markdown("### 2. Region reference")
-
-st.caption(
-    "This map shows the requested bounding box. "
-    "Mask pixels have not yet been transformed into "
-    "georeferenced oil-spill polygons."
+min_lon = st.sidebar.number_input(
+    "Minimum longitude",
+    min_value=-180.0,
+    max_value=180.0,
+    value=-91.0,
+    step=0.1,
+    format="%.4f",
 )
 
-map_view = folium.Map(
-    location=[
-        (bbox[1] + bbox[3]) / 2,
-        (bbox[0] + bbox[2]) / 2,
-    ],
-    zoom_start=7,
+min_lat = st.sidebar.number_input(
+    "Minimum latitude",
+    min_value=-90.0,
+    max_value=90.0,
+    value=27.0,
+    step=0.1,
+    format="%.4f",
 )
 
-folium.Rectangle(
-    bounds=[
-        [bbox[1], bbox[0]],
-        [bbox[3], bbox[2]],
-    ],
-    color="cyan",
-    fill=False,
-).add_to(map_view)
+max_lon = st.sidebar.number_input(
+    "Maximum longitude",
+    min_value=-180.0,
+    max_value=180.0,
+    value=-90.0,
+    step=0.1,
+    format="%.4f",
+)
 
-st_folium(
-    map_view,
-    height=400,
+max_lat = st.sidebar.number_input(
+    "Maximum latitude",
+    min_value=-90.0,
+    max_value=90.0,
+    value=28.0,
+    step=0.1,
+    format="%.4f",
+)
+
+st.sidebar.markdown("### Acquisition dates")
+
+today = date.today()
+default_start = today - timedelta(days=30)
+
+start_date = st.sidebar.date_input(
+    "Start date",
+    value=default_start,
+    max_value=today,
+)
+
+end_date = st.sidebar.date_input(
+    "End date",
+    value=today,
+    min_value=start_date,
+    max_value=today,
+)
+
+st.sidebar.markdown("### Image settings")
+
+image_size = st.sidebar.selectbox(
+    "Output image size",
+    options=[256, 512, 768, 1024],
+    index=1,
+)
+
+run_button = st.sidebar.button(
+    "Fetch data and run screening",
+    type="primary",
     use_container_width=True,
 )
 
 
-# ==================================================
-# DOWNLOAD CANDIDATE MASK
-# ==================================================
+# ============================================================
+# MAIN PAGE
+# ============================================================
 
-mask_bytes = io.BytesIO()
+st.title("VEYORA")
+st.subheader("Satellite-based SAR Oil Spill Screening")
 
-Image.fromarray(
-    (mask * 255).astype(np.uint8)
-).save(
-    mask_bytes,
-    format="PNG",
+st.markdown(
+    """
+    <div class="veyora-note">
+    <b>Purpose:</b> Retrieve Sentinel-1 VV/VH radar data and run a
+    segmentation model to screen for possible oil-spill-like regions.
+    Model outputs are experimental and require validation.
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.download_button(
-    "Download candidate mask",
-    data=mask_bytes.getvalue(),
-    file_name="veyora_mask.png",
-    mime="image/png",
+left, right = st.columns(2)
+
+with left:
+    st.markdown("#### Data source")
+    st.write("Copernicus Sentinel-1 GRD via Sentinel Hub Processing API")
+
+with right:
+    st.markdown("#### AI model")
+    st.write("Two-class segmentation model loaded from `models/best.pt`")
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+bbox = [min_lon, min_lat, max_lon, max_lat]
+
+bbox_is_valid = (
+    min_lon < max_lon
+    and min_lat < max_lat
+    and -180 <= min_lon <= 180
+    and -180 <= max_lon <= 180
+    and -90 <= min_lat <= 90
+    and -90 <= max_lat <= 90
 )
+
+if not bbox_is_valid:
+    st.warning(
+        "Please enter a valid bounding box. Minimum coordinates must be "
+        "smaller than maximum coordinates."
+    )
+
+if start_date > end_date:
+    st.warning("The start date must be on or before the end date.")
+
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
+if run_button:
+    if not bbox_is_valid:
+        st.error("Cannot continue: the bounding box is invalid.")
+
+    elif start_date > end_date:
+        st.error("Cannot continue: the date range is invalid.")
+
+    else:
+        client_id, client_secret = get_credentials()
+
+        if not client_id or not client_secret:
+            st.error(
+                "Sentinel Hub credentials are missing. Add your client ID "
+                "and client secret to Streamlit Cloud → App settings → Secrets."
+            )
+            st.code(
+                """
+SH_CLIENT_ID = "your-client-id"
+SH_CLIENT_SECRET = "your-client-secret"
+                """.strip(),
+                language="toml",
+            )
+
+        else:
+            try:
+                with st.spinner("Authenticating with Sentinel Hub..."):
+                    token = get_access_token(client_id, client_secret)
+
+                with st.spinner("Retrieving Sentinel-1 VV/VH imagery..."):
+                    image = fetch_sentinel1_image(
+                        token=token,
+                        bbox=bbox,
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat(),
+                        width=image_size,
+                        height=image_size,
+                    )
+
+                st.success("Sentinel-1 imagery retrieved successfully.")
+
+                st.markdown("### Retrieved SAR visualisation")
+                st.image(
+                    image,
+                    caption=(
+                        f"SAR-derived pseudo-RGB | "
+                        f"{start_date} to {end_date}"
+                    ),
+                    use_container_width=True,
+                )
+
+                with st.spinner("Loading trained segmentation model..."):
+                    model = load_model()
+
+                with st.spinner("Running experimental AI segmentation..."):
+                    mask, probability = run_inference(model, image)
+
+                overlay = make_overlay(image, mask)
+                mask_image = make_mask_image(mask)
+                probability_image = make_probability_image(probability)
+
+                predicted_pixels = int(mask.sum())
+                total_pixels = int(mask.size)
+                predicted_percentage = (
+                    100.0 * predicted_pixels / total_pixels
+                    if total_pixels
+                    else 0.0
+                )
+
+                st.markdown("### Screening results")
+
+                metric1, metric2, metric3 = st.columns(3)
+
+                metric1.metric(
+                    "Predicted target pixels",
+                    f"{predicted_pixels:,}",
+                )
+
+                metric2.metric(
+                    "Image area flagged",
+                    f"{predicted_percentage:.2f}%",
+                )
+
+                metric3.metric(
+                    "Mean target probability",
+                    f"{float(probability.mean()):.3f}",
+                )
+
+                st.warning(
+                    "These values describe model predictions, not confirmed "
+                    "oil spills. Dark SAR areas can also result from low wind, "
+                    "look-alikes, sensor conditions, or other surface effects."
+                )
+
+                st.markdown("### AI output")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.image(
+                        overlay,
+                        caption="Predicted target regions overlaid on SAR imagery",
+                        use_container_width=True,
+                    )
+
+                with col2:
+                    st.image(
+                        mask_image,
+                        caption="Binary segmentation mask",
+                        use_container_width=True,
+                    )
+
+                st.markdown("### Target-class probability")
+
+                st.image(
+                    probability_image,
+                    caption=(
+                        "Brighter pixels indicate higher model probability "
+                        "for class index 1."
+                    ),
+                    use_container_width=True,
+                )
+
+                st.markdown("### Download outputs")
+
+                download_col1, download_col2, download_col3 = st.columns(3)
+
+                with download_col1:
+                    st.download_button(
+                        "Download SAR image",
+                        data=BytesIO(
+                            _image_bytes := (
+                                lambda buffer: (
+                                    image.save(buffer, format="PNG"),
+                                    buffer.getvalue(),
+                                )[1]
+                            )(BytesIO())
+                        ).getvalue(),
+                        file_name="veyora_sar_image.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+
+                with download_col2:
+                    mask_buffer = BytesIO()
+                    mask_image.save(mask_buffer, format="PNG")
+
+                    st.download_button(
+                        "Download AI mask",
+                        data=mask_buffer.getvalue(),
+                        file_name="veyora_ai_mask.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+
+                with download_col3:
+                    overlay_buffer = BytesIO()
+                    overlay.save(overlay_buffer, format="PNG")
+
+                    st.download_button(
+                        "Download overlay",
+                        data=overlay_buffer.getvalue(),
+                        file_name="veyora_ai_overlay.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+
+                st.caption(
+                    f"Bounding box: {bbox} | "
+                    f"Dates: {start_date} to {end_date} | "
+                    f"Device: {DEVICE}"
+                )
+
+            except Exception as exc:
+                st.error("The screening process could not be completed.")
+                st.code(f"{type(exc).__name__}: {exc}")
+
+                st.markdown(
+                    """
+                    **Troubleshooting**
+                    - Check that Sentinel Hub credentials are correct.
+                    - Check that `models/best.pt` exists in your repository.
+                    - If the error mentions missing or unexpected model keys,
+                      the `TinyUNet` architecture in `tiny_unet.py` must match
+                      the architecture used during training.
+                    - If Sentinel Hub reports no data, try another date range
+                      or a different area of interest.
+                    """
+                )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
 
 st.caption(
-    "VEYORA research prototype • Copernicus Sentinel-1 • "
-    "Do not use these outputs alone for operational alerts."
+    "VEYORA | Experimental satellite-based oil-spill screening. "
+    "AI outputs are not a substitute for expert interpretation or "
+    "independent confirmation."
 )
