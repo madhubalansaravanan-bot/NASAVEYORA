@@ -1,3 +1,4 @@
+
 import io
 from pathlib import Path
 from datetime import date, timedelta
@@ -9,16 +10,15 @@ import requests
 import streamlit as st
 import torch
 from PIL import Image
-import rasterio
 from rasterio.io import MemoryFile
 from streamlit_folium import st_folium
 
 from tiny_unet import TinyUNet
 
 
-# --------------------------------------------------
+# ==================================================
 # VEYORA CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 st.set_page_config(
     page_title="VEYORA | Satellite Intelligence",
@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("🛰️ VEYORA")
-st.subheader("Sentinel-1 Oil-Spill Candidate Screening")
+st.subheader("Live Sentinel-1 Oil-Spill Candidate Screening")
 
 TOKEN_URL = (
     "https://identity.dataspace.copernicus.eu/"
@@ -36,12 +36,12 @@ TOKEN_URL = (
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "best.pt"
+MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
 
-# --------------------------------------------------
+# ==================================================
 # COPERNICUS AUTHENTICATION
-# --------------------------------------------------
+# ==================================================
 
 @st.cache_data(ttl=3000, show_spinner=False)
 def get_access_token(client_id, client_secret):
@@ -58,9 +58,9 @@ def get_access_token(client_id, client_secret):
     return response.json()["access_token"]
 
 
-# --------------------------------------------------
+# ==================================================
 # FETCH SENTINEL-1 VV / VH DATA
-# --------------------------------------------------
+# ==================================================
 
 def fetch_sentinel1(bbox, start_date, end_date, token):
     evalscript = """
@@ -150,16 +150,15 @@ def fetch_sentinel1(bbox, start_date, end_date, token):
 
     if bands.shape[0] != 2:
         raise ValueError(
-            f"Expected two Sentinel-1 bands (VV/VH); "
-            f"received shape {bands.shape}"
+            f"Expected two VV/VH bands, got {bands.shape}"
         )
 
     return bands, profile
 
 
-# --------------------------------------------------
-# MODEL LOADING
-# --------------------------------------------------
+# ==================================================
+# LOAD TRAINED TINYUNET MODEL
+# ==================================================
 
 @st.cache_resource
 def load_model(model_path_string, model_mtime):
@@ -175,7 +174,7 @@ def load_model(model_path_string, model_mtime):
         weights_only=True,
     )
 
-    # Training saves a dictionary containing model_state.
+    # Training saves the weights inside "model_state".
     state_dict = checkpoint.get("model_state", checkpoint)
     model.load_state_dict(state_dict)
     model.eval()
@@ -183,18 +182,17 @@ def load_model(model_path_string, model_mtime):
     return model
 
 
-# --------------------------------------------------
+# ==================================================
 # SAR PREPROCESSING
-# --------------------------------------------------
+# ==================================================
 
 def to_db(bands):
     """Convert linear radar power to decibels."""
-    safe = np.maximum(bands, 1e-10)
-    return 10.0 * np.log10(safe)
+    return 10.0 * np.log10(np.maximum(bands, 1e-10))
 
 
 def display_rgb(vv_db):
-    """Display the VV radar image as grayscale RGB."""
+    """Display the VV radar band as grayscale RGB."""
     valid = np.isfinite(vv_db)
 
     if not valid.any():
@@ -204,8 +202,7 @@ def display_rgb(vv_db):
 
     gray = np.clip(
         (np.nan_to_num(vv_db, nan=lo) - lo)
-        / max(hi - lo, 1e-6)
-        * 255,
+        / max(hi - lo, 1e-6) * 255,
         0,
         255,
     ).astype(np.uint8)
@@ -213,18 +210,17 @@ def display_rgb(vv_db):
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
 
-# --------------------------------------------------
-# EXPERIMENTAL MODEL INPUT
-# --------------------------------------------------
+# ==================================================
+# EXPERIMENTAL VV/VH TO PSEUDO-RGB INPUT
+# ==================================================
 
 def prepare_model_input(bands_db):
     """
-    Convert VV/VH into a pseudo-RGB tensor.
+    Convert live VV/VH radar bands into three channels.
 
-    IMPORTANT:
-    The model was trained on RGB SAR-derived images,
-    not directly on these live VV/VH arrays.
-    This conversion is experimental and needs validation.
+    This is an approximation. The model was trained on
+    RGB images, so live predictions require further
+    validation before they can be considered reliable.
     """
     vv = bands_db[0]
     vh = bands_db[1]
@@ -238,22 +234,24 @@ def prepare_model_input(bands_db):
         axis=0,
     ).astype(np.float32)
 
-    resized = np.stack(
-        [
-            cv2.resize(
-                channel,
-                (256, 256),
-                interpolation=cv2.INTER_AREA,
-            )
-            for channel in pseudo_rgb
-        ],
-        axis=0,
-    )
+    resized = np.stack([
+        cv2.resize(
+            channel,
+            (256, 256),
+            interpolation=cv2.INTER_AREA,
+        )
+        for channel in pseudo_rgb
+    ])
 
     return torch.from_numpy(resized[None]).float()
 
 
 def predict_with_model(bands_db):
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Model checkpoint not found: {MODEL_PATH}"
+        )
+
     model = load_model(
         str(MODEL_PATH),
         MODEL_PATH.stat().st_mtime,
@@ -263,6 +261,9 @@ def predict_with_model(bands_db):
 
     with torch.no_grad():
         logits = model(tensor)
+
+        # Two-class model: class 0 = background,
+        # class 1 = labelled slick.
         probabilities = torch.softmax(logits, dim=1)[0, 1]
         probabilities = probabilities.cpu().numpy()
 
@@ -275,9 +276,9 @@ def predict_with_model(bands_db):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # DARK-TARGET FALLBACK
-# --------------------------------------------------
+# ==================================================
 
 def dark_target_fallback(vv_db, threshold_db, min_pixels):
     valid = np.isfinite(vv_db)
@@ -302,9 +303,9 @@ def dark_target_fallback(vv_db, threshold_db, min_pixels):
     return mask
 
 
-# --------------------------------------------------
+# ==================================================
 # SIDEBAR
-# --------------------------------------------------
+# ==================================================
 
 with st.sidebar:
     st.header("Satellite search")
@@ -375,9 +376,9 @@ with st.sidebar:
     )
 
 
-# --------------------------------------------------
-# VALIDATE INPUTS AND FETCH DATA
-# --------------------------------------------------
+# ==================================================
+# FETCH SATELLITE DATA
+# ==================================================
 
 if run:
     if not (-180 <= west < east <= 180):
@@ -393,9 +394,7 @@ if run:
         st.stop()
 
     if east - west > 3 or north - south > 3:
-        st.error(
-            "Choose an area no larger than 3 degrees per side."
-        )
+        st.error("Choose an area no larger than 3 degrees per side.")
         st.stop()
 
     try:
@@ -409,13 +408,8 @@ if run:
         st.stop()
 
     try:
-        with st.spinner(
-            "Fetching Sentinel-1 VV/VH data from Copernicus..."
-        ):
-            token = get_access_token(
-                client_id,
-                client_secret,
-            )
+        with st.spinner("Fetching Sentinel-1 VV/VH data..."):
+            token = get_access_token(client_id, client_secret)
 
             bands, profile = fetch_sentinel1(
                 [west, south, east, north],
@@ -426,9 +420,7 @@ if run:
 
         st.session_state["bands"] = bands
         st.session_state["profile"] = profile
-        st.session_state["bbox"] = [
-            west, south, east, north
-        ]
+        st.session_state["bbox"] = [west, south, east, north]
 
         st.success("Satellite data received successfully.")
 
@@ -436,13 +428,13 @@ if run:
         st.error(f"Satellite request failed: {exc}")
 
 
-# --------------------------------------------------
-# RESULTS
-# --------------------------------------------------
+# ==================================================
+# DISPLAY RESULTS
+# ==================================================
 
 if "bands" not in st.session_state:
     st.info(
-        "Choose a region and date range, then click "
+        "Choose an area and date range, then click "
         "'Fetch Sentinel-1'."
     )
     st.stop()
@@ -457,7 +449,6 @@ vv_db = bands_db[0]
 st.markdown("### 1. Live Sentinel-1 imagery")
 
 left, right = st.columns(2)
-
 base_rgb = display_rgb(vv_db)
 
 with left:
@@ -468,17 +459,15 @@ with left:
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # RUN MODEL OR FALLBACK
-# --------------------------------------------------
+# ==================================================
 
 probabilities = None
 
-if MODEL_PATH.exists():
+if MODEL_PATH.is_file():
     try:
-        with st.spinner(
-            "Running experimental TinyUNet segmentation..."
-        ):
+        with st.spinner("Loading TinyUNet and analysing image..."):
             probabilities = predict_with_model(bands_db)
 
         mask = (
@@ -488,12 +477,8 @@ if MODEL_PATH.exists():
         mode = "Experimental TinyUNet"
 
     except Exception as exc:
-        st.warning(
-            f"Model inference failed: {exc}"
-        )
-        st.info(
-            "Using the dark-target screening fallback."
-        )
+        st.warning(f"Model inference failed: {exc}")
+        st.info("Using the dark-target screening fallback.")
 
         mask = dark_target_fallback(
             vv_db,
@@ -505,7 +490,7 @@ if MODEL_PATH.exists():
 
 else:
     st.warning(
-        "best.pt was not found. Using the screening fallback."
+        f"Model file not found at: {MODEL_PATH}"
     )
 
     mask = dark_target_fallback(
@@ -517,15 +502,20 @@ else:
     mode = "Dark-target screening fallback"
 
 
-# --------------------------------------------------
+# ==================================================
 # DISPLAY PREDICTIONS
-# --------------------------------------------------
+# ==================================================
 
 with right:
     overlay = base_rgb.copy()
     overlay[mask == 1] = [255, 40, 40]
+
     overlay = cv2.addWeighted(
-        base_rgb, 0.65, overlay, 0.35, 0
+        base_rgb,
+        0.65,
+        overlay,
+        0.35,
+        0,
     )
 
     st.image(
@@ -536,68 +526,52 @@ with right:
 
 if probabilities is not None:
     st.warning(
-        "EXPERIMENTAL AI OUTPUT: The model was trained on "
-        "RGB SAR-derived images. Live VV/VH inputs use an "
-        "approximate conversion, so these predictions are "
-        "not validated oil-spill detections. Human review "
-        "and testing on independently labelled Sentinel-1 "
-        "scenes are required."
+        "EXPERIMENTAL AI OUTPUT: This model was trained "
+        "on RGB SAR-derived images. Live VV/VH inputs use "
+        "an approximate conversion. These predictions are "
+        "not validated oil-spill detections; independent "
+        "testing and human review are required."
     )
 
     st.image(
-        np.clip(
-            probabilities * 255, 0, 255
-        ).astype(np.uint8),
+        np.clip(probabilities * 255, 0, 255).astype(np.uint8),
         caption="Experimental class-1 probability map",
         use_container_width=True,
     )
 
 else:
     st.warning(
-        "SCREENING MODE: Dark radar areas are not proof of oil. "
-        "Low wind, natural films, and other radar effects can "
-        "produce similar signatures."
+        "SCREENING MODE: This is a dark-target heuristic, "
+        "not AI. Dark radar features can be caused by low "
+        "wind, natural films, and other radar effects."
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # SUMMARY METRICS
-# --------------------------------------------------
+# ==================================================
 
 positive_pixels = int(mask.sum())
 total_pixels = mask.size
-coverage = (
-    100.0 * positive_pixels / max(total_pixels, 1)
-)
+coverage = 100.0 * positive_pixels / max(total_pixels, 1)
 
 m1, m2, m3 = st.columns(3)
 
-m1.metric(
-    "Candidate pixels",
-    f"{positive_pixels:,}",
-)
-
-m2.metric(
-    "Image coverage",
-    f"{coverage:.2f}%",
-)
-
-m3.metric(
-    "Analysis mode",
-    mode,
-)
+m1.metric("Candidate pixels", f"{positive_pixels:,}")
+m2.metric("Image coverage", f"{coverage:.2f}%")
+m3.metric("Analysis mode", mode)
 
 
-# --------------------------------------------------
+# ==================================================
 # REGION REFERENCE MAP
-# --------------------------------------------------
+# ==================================================
 
 st.markdown("### 2. Region reference")
 
 st.caption(
     "This map shows the requested bounding box. "
-    "Candidate mask pixels have not yet been transformed "
-    "into georeferenced oil-spill polygons."
+    "Mask pixels have not yet been transformed into "
+    "georeferenced oil-spill polygons."
 )
 
 map_view = folium.Map(
@@ -624,9 +598,9 @@ st_folium(
 )
 
 
-# --------------------------------------------------
-# DOWNLOAD PREDICTED MASK
-# --------------------------------------------------
+# ==================================================
+# DOWNLOAD CANDIDATE MASK
+# ==================================================
 
 mask_bytes = io.BytesIO()
 
@@ -646,5 +620,5 @@ st.download_button(
 
 st.caption(
     "VEYORA research prototype • Copernicus Sentinel-1 • "
-    "Outputs are candidate regions, not confirmed oil spills."
+    "Do not use these outputs alone for operational alerts."
 )
