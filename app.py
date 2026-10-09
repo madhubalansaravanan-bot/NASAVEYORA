@@ -82,19 +82,24 @@ def get_secret(*names):
     return None
 
 
+
 def get_credentials():
     client_id = get_secret(
         "SH_CLIENT_ID",
         "SENTINEL_HUB_CLIENT_ID",
+        "CDSE_CLIENT_ID",
         "CLIENT_ID",
     )
+
     client_secret = get_secret(
         "SH_CLIENT_SECRET",
         "SENTINEL_HUB_CLIENT_SECRET",
+        "CDSE_CLIENT_SECRET",
         "CLIENT_SECRET",
     )
 
     return client_id, client_secret
+
 
 
 # ============================================================
