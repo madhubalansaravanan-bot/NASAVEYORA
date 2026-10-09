@@ -1,10 +1,7 @@
 streamlit
 requests
 numpy
-opencv-python-headless
 Pillow
-rasterio
+torch
 folium
 streamlit-folium
-torch
-scikit-learn
