@@ -14,7 +14,7 @@ from PIL import Image
 from rasterio.io import MemoryFile
 from streamlit_folium import st_folium
 
-from unet_model import UNet
+from tiny_unet import TinyUNet
 
 
 st.set_page_config(
