@@ -1,263 +1,434 @@
-import streamlit as st
-import numpy as np
-import cv2
-from PIL import Image
-import folium
-from streamlit_folium import st_folium
 import io
+from datetime import date, timedelta
 
-try:
-    import rasterio
-    from rasterio.io import MemoryFile
-    RASTERIO_AVAILABLE = True
-except ImportError:
-    RASTERIO_AVAILABLE = False
+import cv2
+import folium
+import numpy as np
+import rasterio
+import requests
+import streamlit as st
+from rasterio.io import MemoryFile
+from streamlit_folium import st_folium
 
+
+# --------------------------------------------------
+# VEYORA: LIVE SENTINEL-1 SAR SCREENING
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="VEYORA | SAR Intelligence",
+    page_title="VEYORA | Satellite Intelligence",
     page_icon="🛰️",
     layout="wide"
 )
 
 st.markdown("""
 <style>
-.stApp {background-color: #07111f; color: #e5eefb;}
+.stApp {
+    background: #07111f;
+    color: #e6f1ff;
+}
+h1, h2, h3 {
+    color: #65d9ff !important;
+}
 [data-testid="stMetric"] {
     background: #101f32;
-    padding: 18px;
+    padding: 16px;
     border-radius: 12px;
-    border: 1px solid #233b55;
 }
-h1, h2, h3 {color: #65d9ff;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛰️ VEYORA")
-st.subheader("SAR-Based Marine Oil Spill Screening")
-st.caption(
-    "Earth observation • Image analysis • Environmental awareness"
+TOKEN_URL = (
+    "https://identity.dataspace.copernicus.eu/"
+    "auth/realms/CDSE/protocol/openid-connect/token"
 )
+PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
+
+
+# --------------------------------------------------
+# AUTHENTICATION
+# --------------------------------------------------
+
+@st.cache_data(ttl=3000, show_spinner=False)
+def get_access_token(client_id, client_secret):
+    response = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret
+        },
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+# --------------------------------------------------
+# DOWNLOAD TWO-BAND SENTINEL-1 DATA
+# --------------------------------------------------
+
+def fetch_sentinel1(bbox, start_date, end_date, token):
+    """
+    bbox order: west, south, east, north.
+    Requests VV and VH in linear-power units.
+    """
+    evalscript = """
+    //VERSION=3
+
+    function setup() {
+        return {
+            input: [{
+                bands: ["VV", "VH"],
+                units: "LINEAR_POWER"
+            }],
+            output: {
+                bands: 2,
+                sampleType: "FLOAT32"
+            }
+        };
+    }
+
+    function evaluatePixel(sample) {
+        return [sample.VV, sample.VH];
+    }
+    """
+
+    payload = {
+        "input": {
+            "bounds": {
+                "bbox": bbox,
+                "properties": {
+                    "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"
+                }
+            },
+            "data": [{
+                "type": "sentinel-1-grd",
+                "dataFilter": {
+                    "timeRange": {
+                        "from": f"{start_date}T00:00:00Z",
+                        "to": f"{end_date}T23:59:59Z"
+                    },
+                    "acquisitionMode": "IW",
+                    "polarization": "DV"
+                }
+            }]
+        },
+        "output": {
+            "width": 512,
+            "height": 512,
+            "responses": [{
+                "identifier": "default",
+                "format": {
+                    "type": "image/tiff"
+                }
+            }]
+        },
+        "evalscript": evalscript
+    }
+
+    response = requests.post(
+        PROCESS_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=180
+    )
+
+    if not response.ok:
+        detail = response.text[:1500]
+        raise RuntimeError(
+            f"Sentinel Hub returned HTTP {response.status_code}: {detail}"
+        )
+
+    with MemoryFile(response.content) as memfile:
+        with memfile.open() as src:
+            bands = src.read().astype(np.float32)
+            profile = {
+                "crs": str(src.crs) if src.crs else None,
+                "transform": tuple(src.transform),
+                "width": src.width,
+                "height": src.height,
+                "bounds": tuple(src.bounds)
+            }
+
+    if bands.shape[0] != 2:
+        raise ValueError(
+            f"Expected VV and VH bands, received shape {bands.shape}"
+        )
+
+    return bands, profile
+
+
+# --------------------------------------------------
+# FALLBACK: DARK-TARGET SCREENING
+# --------------------------------------------------
+
+def screen_dark_targets(vv_linear, threshold_db, min_pixels):
+    """
+    Heuristic screening only. NOT a trained AI model.
+    """
+    valid = np.isfinite(vv_linear) & (vv_linear > 0)
+
+    vv_db = np.full(vv_linear.shape, np.nan, dtype=np.float32)
+    vv_db[valid] = 10 * np.log10(vv_linear[valid])
+
+    # Fill invalid values before filtering; exclude them afterwards.
+    clean = np.where(valid, vv_db, 0).astype(np.float32)
+    smooth = cv2.GaussianBlur(clean, (5, 5), 0)
+
+    candidates = (
+        (smooth < threshold_db) & valid
+    ).astype(np.uint8)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidates, connectivity=8
+    )
+
+    mask = np.zeros_like(candidates)
+    regions = []
+
+    for index in range(1, count):
+        pixels = int(stats[index, cv2.CC_STAT_AREA])
+        if pixels >= min_pixels:
+            mask[labels == index] = 1
+            regions.append(pixels)
+
+    return vv_db, mask, regions
+
+
+# --------------------------------------------------
+# DASHBOARD
+# --------------------------------------------------
+
+st.title("🛰️ VEYORA")
+st.subheader("Live Sentinel-1 Marine Oil-Spill Screening")
 
 st.warning(
-    "Research prototype: dark SAR features may be oil, but can also "
-    "be natural look-alikes. This screening algorithm is not a trained "
-    "or validated oil-spill AI model."
+    "SCREENING MODE — No trained AI model is installed. "
+    "Dark radar targets are not proof of oil; low wind, natural films, "
+    "and other effects can produce similar signatures."
 )
 
 with st.sidebar:
-    st.header("Mission settings")
-    latitude = st.number_input(
-        "Approximate latitude",
-        min_value=-90.0, max_value=90.0,
-        value=13.05, step=0.01
-    )
-    longitude = st.number_input(
-        "Approximate longitude",
-        min_value=-180.0, max_value=180.0,
-        value=80.32, step=0.01
-    )
-    threshold = st.slider(
-        "Dark-pixel threshold",
-        min_value=5, max_value=120, value=45
-    )
-    min_region = st.slider(
-        "Minimum region size (pixels)",
-        min_value=10, max_value=2000, value=100
+    st.header("Satellite search")
+
+    region = st.selectbox(
+        "Area of interest",
+        ["Chennai Coast", "Gulf of Mexico", "Custom region"]
     )
 
-st.markdown("### 1. Upload satellite imagery")
-
-uploaded = st.file_uploader(
-    "Upload a Sentinel-1 SAR image",
-    type=["png", "jpg", "jpeg", "tif", "tiff"]
-)
-
-if uploaded is None:
-    st.info(
-        "Upload a SAR image to begin. For best results, use a "
-        "single-band grayscale SAR image or a georeferenced GeoTIFF."
-    )
-    st.markdown("""
-    **Prototype workflow**
-
-    1. Upload SAR imagery.
-    2. Inspect and preprocess the image.
-    3. Screen for dark regions.
-    4. Review candidate regions and their locations.
-    5. Export the screening result for further analysis.
-    """)
-    st.stop()
-
-raw_bytes = uploaded.getvalue()
-geotiff = uploaded.name.lower().endswith((".tif", ".tiff"))
-transform = None
-crs = None
-pixel_area_m2 = None
-
-try:
-    if geotiff and RASTERIO_AVAILABLE:
-        with MemoryFile(raw_bytes) as memfile:
-            with memfile.open() as src:
-                band = src.read(1).astype(np.float32)
-                transform = src.transform
-                crs = src.crs
-                if src.crs and src.crs.is_projected:
-                    pixel_area_m2 = abs(
-                        src.transform.a * src.transform.e
-                        - src.transform.b * src.transform.d
-                    )
-                nodata = src.nodata
-                if nodata is not None:
-                    band[band == nodata] = np.nan
-
-        valid = np.isfinite(band)
-        if not valid.any():
-            st.error("The GeoTIFF contains no valid pixels.")
-            st.stop()
-
-        low, high = np.nanpercentile(band, [2, 98])
-        if high <= low:
-            st.error("Image has insufficient intensity variation.")
-            st.stop()
-
-        scaled = np.nan_to_num(
-            (band - low) / (high - low) * 255,
-            nan=0
-        )
-        gray = np.clip(scaled, 0, 255).astype(np.uint8)
-        gray[~valid] = 0
-
+    if region == "Chennai Coast":
+        default_bbox = [80.0, 12.5, 81.0, 13.5]
+    elif region == "Gulf of Mexico":
+        default_bbox = [-92.0, 25.0, -90.0, 27.0]
     else:
-        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-        rgb = np.array(image)
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        valid = np.ones(gray.shape, dtype=bool)
+        default_bbox = [80.0, 12.5, 81.0, 13.5]
 
-except Exception as exc:
-    st.error(f"Unable to read this image: {exc}")
+    west = st.number_input(
+        "West longitude", value=float(default_bbox[0]),
+        min_value=-180.0, max_value=180.0, format="%.4f"
+    )
+    south = st.number_input(
+        "South latitude", value=float(default_bbox[1]),
+        min_value=-90.0, max_value=90.0, format="%.4f"
+    )
+    east = st.number_input(
+        "East longitude", value=float(default_bbox[2]),
+        min_value=-180.0, max_value=180.0, format="%.4f"
+    )
+    north = st.number_input(
+        "North latitude", value=float(default_bbox[3]),
+        min_value=-90.0, max_value=90.0, format="%.4f"
+    )
+
+    today = date.today()
+    end_date = st.date_input(
+        "Acquisition end date", value=today
+    )
+    start_date = st.date_input(
+        "Acquisition start date",
+        value=today - timedelta(days=30)
+    )
+
+    st.divider()
+    st.header("Screening parameters")
+
+    threshold_db = st.slider(
+        "VV dark-target threshold (dB)",
+        min_value=-35.0, max_value=-5.0,
+        value=-18.0, step=0.5
+    )
+    min_pixels = st.slider(
+        "Minimum region size (pixels)",
+        min_value=5, max_value=500,
+        value=25
+    )
+
+    run_search = st.button(
+        "🛰️ Fetch satellite data",
+        type="primary",
+        use_container_width=True
+    )
+
+
+if run_search:
+    if not (-180 <= west < east <= 180):
+        st.error("Longitude bounds are invalid.")
+        st.stop()
+
+    if not (-90 <= south < north <= 90):
+        st.error("Latitude bounds are invalid.")
+        st.stop()
+
+    if start_date > end_date:
+        st.error("Start date must be before end date.")
+        st.stop()
+
+    if (east - west) > 3 or (north - south) > 3:
+        st.error(
+            "Please select a smaller area (maximum 3 degrees "
+            "in either dimension) for this prototype."
+        )
+        st.stop()
+
+    try:
+        client_id = st.secrets["CDSE_CLIENT_ID"]
+        client_secret = st.secrets["CDSE_CLIENT_SECRET"]
+    except Exception:
+        st.error(
+            "Missing API credentials. Add CDSE_CLIENT_ID and "
+            "CDSE_CLIENT_SECRET in Streamlit App Settings → Secrets."
+        )
+        st.stop()
+
+    bbox = [west, south, east, north]
+
+    try:
+        with st.spinner(
+            "Authenticating and requesting Sentinel-1 radar data..."
+        ):
+            token = get_access_token(client_id, client_secret)
+            bands, profile = fetch_sentinel1(
+                bbox, start_date.isoformat(),
+                end_date.isoformat(), token
+            )
+
+        st.session_state["sar_bands"] = bands
+        st.session_state["sar_profile"] = profile
+        st.session_state["sar_bbox"] = bbox
+        st.session_state["sar_dates"] = (
+            start_date.isoformat(), end_date.isoformat()
+        )
+        st.success("Radar data received from Sentinel Hub.")
+
+    except Exception as exc:
+        st.error(f"Satellite request failed: {exc}")
+        st.info(
+            "Check OAuth credentials, API access, date range, "
+            "data availability, and the service response."
+        )
+
+
+if "sar_bands" not in st.session_state:
+    st.info(
+        "Choose an area and date range, then click "
+        "'Fetch satellite data' to retrieve live SAR data."
+    )
     st.stop()
 
-# Light smoothing reduces isolated pixel noise.
-smoothed = cv2.GaussianBlur(gray, (5, 5), 0)
 
-# Simple dark-region screening, NOT a trained AI model.
-candidate = ((smoothed < threshold) & valid).astype(np.uint8)
+bands = st.session_state["sar_bands"]
+profile = st.session_state["sar_profile"]
+bbox = st.session_state["sar_bbox"]
+dates = st.session_state["sar_dates"]
 
-count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-    candidate, connectivity=8
+vv = bands[0]
+vh = bands[1]
+
+vv_db, mask, regions = screen_dark_targets(
+    vv, threshold_db, min_pixels
 )
 
-mask = np.zeros_like(candidate, dtype=np.uint8)
-regions = []
+valid = np.isfinite(vv_db)
+if valid.any():
+    low, high = np.percentile(vv_db[valid], [2, 98])
+    display = np.clip(
+        (np.nan_to_num(vv_db, nan=low) - low)
+        / max(high - low, 1e-6) * 255,
+        0, 255
+    ).astype(np.uint8)
+else:
+    display = np.zeros(vv_db.shape, dtype=np.uint8)
 
-for i in range(1, count):
-    area_px = int(stats[i, cv2.CC_STAT_AREA])
-    if area_px >= min_region:
-        mask[labels == i] = 1
-        regions.append({
-            "id": len(regions) + 1,
-            "pixels": area_px,
-            "cx": float(centroids[i][0]),
-            "cy": float(centroids[i][1])
-        })
+rgb = cv2.cvtColor(display, cv2.COLOR_GRAY2RGB)
+overlay = rgb.copy()
+overlay[mask == 1] = [255, 35, 35]
+overlay = cv2.addWeighted(rgb, 0.65, overlay, 0.35, 0)
 
-mask_pixels = int(mask.sum())
-valid_pixels = int(valid.sum())
-coverage = 100 * mask_pixels / max(valid_pixels, 1)
-
-# Create a visual overlay.
-rgb_display = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-overlay = rgb_display.copy()
-overlay[mask == 1] = [255, 55, 55]
-visual = cv2.addWeighted(rgb_display, 0.70, overlay, 0.30, 0)
-
-st.markdown("### 2. Image analysis")
+st.markdown("### Satellite acquisition request")
+st.write(f"**Requested dates:** {dates[0]} to {dates[1]}")
+st.write(
+    "**Requested area:** "
+    f"{bbox[0]:.4f}, {bbox[1]:.4f}, "
+    f"{bbox[2]:.4f}, {bbox[3]:.4f}"
+)
+st.caption(
+    "The request window is not necessarily the exact acquisition "
+    "time of a single scene. Processing API requests may combine "
+    "available observations over the requested interval."
+)
 
 left, right = st.columns(2)
-
 with left:
-    st.image(gray, caption="Processed SAR intensity", use_container_width=True)
-
+    st.image(display, caption="Sentinel-1 VV intensity (display stretch)")
 with right:
-    st.image(visual, caption="Dark-region candidates in red", use_container_width=True)
+    st.image(overlay, caption="Red = dark-target screening candidates")
+
+total = int(valid.sum())
+candidate_pixels = int(mask.sum())
+coverage = 100 * candidate_pixels / max(total, 1)
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Candidate regions", len(regions))
-m2.metric("Candidate pixels", f"{mask_pixels:,}")
+m2.metric("Candidate pixels", f"{candidate_pixels:,}")
 m3.metric("Image coverage", f"{coverage:.2f}%")
 
-if len(regions):
-    st.warning(
-        f"{len(regions)} dark region(s) passed the selected pixel-size "
-        "filter. These are candidates, not confirmed oil spills."
-    )
-else:
-    st.info("No dark regions passed the current screening settings.")
-
-# Only calculate area when a projected GeoTIFF supplies usable pixel scale.
-st.markdown("### 3. Area estimate")
-
-if pixel_area_m2 is not None:
-    estimated_area_km2 = mask_pixels * pixel_area_m2 / 1_000_000
-    st.metric("Candidate area", f"{estimated_area_km2:.4f} km²")
-    st.caption(
-        "This is the area of threshold-selected pixels, not a validated "
-        "oil-spill area. Confirm the CRS, pixel scale, calibration and mask."
-    )
-else:
-    st.info(
-        "Physical area is unavailable because the image has no usable "
-        "projected pixel scale. Upload a correctly georeferenced GeoTIFF "
-        "to estimate area."
-    )
-
-# Export binary mask and overlay.
-mask_png = Image.fromarray(mask * 255)
-buffer = io.BytesIO()
-mask_png.save(buffer, format="PNG")
-
-st.download_button(
-    "Download candidate mask (PNG)",
-    data=buffer.getvalue(),
-    file_name="veyora_candidate_mask.png",
-    mime="image/png"
-)
-
-overlay_buffer = io.BytesIO()
-Image.fromarray(visual).save(overlay_buffer, format="PNG")
-
-st.download_button(
-    "Download analysis overlay (PNG)",
-    data=overlay_buffer.getvalue(),
-    file_name="veyora_analysis_overlay.png",
-    mime="image/png"
-)
-
-st.markdown("### 4. Location reference")
-
+st.markdown("### Reference map")
 st.caption(
-    "The pin below is the approximate coordinate entered in the sidebar. "
-    "It is not automatically derived from the uploaded image."
+    "The map shows the requested region, not automatically "
+    "geolocated individual candidate pixels."
 )
 
-map_object = folium.Map(
-    location=[latitude, longitude],
-    zoom_start=7,
-    tiles="OpenStreetMap"
+map_obj = folium.Map(
+    location=[(south + north) / 2, (west + east) / 2],
+    zoom_start=7
 )
 
-folium.Marker(
-    [latitude, longitude],
-    tooltip="User-supplied reference coordinate",
-    popup=f"Reference: {latitude:.4f}, {longitude:.4f}",
-    icon=folium.Icon(color="blue", icon="info-sign")
-).add_to(map_object)
+folium.Rectangle(
+    bounds=[[south, west], [north, east]],
+    color="cyan",
+    fill=False,
+    tooltip="Requested satellite area"
+).add_to(map_obj)
 
-st_folium(map_object, width=None, height=420)
+st_folium(map_obj, height=420, use_container_width=True)
+
+mask_buffer = io.BytesIO()
+from PIL import Image
+Image.fromarray(mask * 255).save(mask_buffer, format="PNG")
+
+st.download_button(
+    "Download screening mask",
+    data=mask_buffer.getvalue(),
+    file_name="veyora_screening_mask.png",
+    mime="image/png"
+)
 
 st.markdown("---")
 st.caption(
-    "VEYORA prototype • SAR dark-target screening • "
-    "Human review and independent validation required"
+    "VEYORA • Copernicus Sentinel-1 via Sentinel Hub • "
+    "Dark-target screening is not confirmed oil-spill detection."
 )
